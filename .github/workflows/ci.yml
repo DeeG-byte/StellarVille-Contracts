@@ -1,0 +1,35 @@
+name: Smart Contracts CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    name: Build Soroban WASM & Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain & wasm32 target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting & compilation
+        run: cargo check --workspace
+
+      - name: Build release WASM contracts
+        run: cargo build --target wasm32-unknown-unknown --release
+
+      - name: Run unit tests
+        run: cargo test --workspace
