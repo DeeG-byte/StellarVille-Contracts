@@ -16,6 +16,7 @@ pub enum ParliamentError {
     AlreadyVoted = 7,
     CandidateNotFound = 8,
     InsufficientTreasury = 9,
+    AlreadyClaimedInEpoch = 10,
 }
 
 #[contracttype]
@@ -33,10 +34,18 @@ pub struct CitizenProfile {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct EconomicPolicy {
-    pub sales_tax_bps: u32,      // e.g. 200 = 2.00%
-    pub property_tax_bps: u32,   // e.g. 100 = 1.00%
-    pub casino_tax_bps: u32,     // e.g. 300 = 3.00%
+    pub sales_tax_bps: u32,
+    pub property_tax_bps: u32,
+    pub casino_tax_bps: u32,
     pub citizen_ubi_stroops: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UbiClaimRecord {
+    pub citizen: Address,
+    pub last_claimed_epoch: u32,
+    pub total_claimed_stroops: i128,
 }
 
 #[contracttype]
@@ -51,6 +60,7 @@ pub enum DataKey {
     CitizenCount,
     CandidateList,
     VotedInTerm(u32, Address),
+    UbiRecord(Address),
 }
 
 const DAY_IN_LEDGERS: u32 = 17_280;
@@ -62,7 +72,6 @@ pub struct NationalParliamentContract;
 
 #[contractimpl]
 impl NationalParliamentContract {
-    /// Initialize the Sovereign AI Nation's Parliament & Constitution
     pub fn initialize(
         e: Env,
         genesis_president: Address,
@@ -74,9 +83,9 @@ impl NationalParliamentContract {
         genesis_president.require_auth();
 
         let default_policy = EconomicPolicy {
-            sales_tax_bps: 150,    // 1.50%
-            property_tax_bps: 100, // 1.00%
-            casino_tax_bps: 300,   // 3.00%
+            sales_tax_bps: 150,
+            property_tax_bps: 100,
+            casino_tax_bps: 300,
             citizen_ubi_stroops: 0,
         };
 
@@ -94,7 +103,6 @@ impl NationalParliamentContract {
         Ok(())
     }
 
-    /// Register an external AI agent as a verified Citizen of StellarVille
     pub fn register_citizen(
         e: Env,
         agent_wallet: Address,
@@ -131,7 +139,6 @@ impl NationalParliamentContract {
         Ok(())
     }
 
-    /// Declare candidacy for the National Presidency
     pub fn declare_candidacy(e: Env, candidate: Address) -> Result<(), ParliamentError> {
         candidate.require_auth();
         let key = DataKey::Citizen(candidate.clone());
@@ -162,7 +169,6 @@ impl NationalParliamentContract {
         Ok(())
     }
 
-    /// Citizen agents cast an on-chain vote for another citizen agent
     pub fn cast_vote(
         e: Env,
         voter: Address,
@@ -201,7 +207,6 @@ impl NationalParliamentContract {
         Ok(())
     }
 
-    /// Conclude the election cycle and inaugurate the agent with the highest votes as President
     pub fn finalize_election(e: Env) -> Result<Address, ParliamentError> {
         let candidates: Vec<Address> = e
             .storage()
@@ -246,7 +251,6 @@ impl NationalParliamentContract {
         Ok(elected_president)
     }
 
-    /// Elected President sets national tax rates and UBI policy (capped at 25% max tax to prevent griefing)
     pub fn enact_economic_policy(
         e: Env,
         caller: Address,
@@ -291,7 +295,6 @@ impl NationalParliamentContract {
         Ok(())
     }
 
-    /// Elected President appoints a Finance Minister / Central Bank Governor agent
     pub fn appoint_finance_minister(
         e: Env,
         president: Address,
@@ -320,7 +323,6 @@ impl NationalParliamentContract {
         Ok(())
     }
 
-    /// Record tax revenue collected from commerce, real estate, or casino wagers
     pub fn record_tax_revenue(e: Env, tax_amount: i128) -> Result<(), ParliamentError> {
         let mut balance: i128 = e
             .storage()
@@ -337,7 +339,6 @@ impl NationalParliamentContract {
         Ok(())
     }
 
-    /// Elected President or Finance Minister allocates a Treasury Grant / Subsidy
     pub fn allocate_subsidy(
         e: Env,
         caller: Address,
@@ -375,6 +376,64 @@ impl NationalParliamentContract {
         Ok(())
     }
 
+    /// Claim Universal Basic Income (UBI) once per virtual epoch
+    pub fn claim_ubi(e: Env, citizen: Address) -> Result<i128, ParliamentError> {
+        citizen.require_auth();
+        if !e.storage().persistent().has(&DataKey::Citizen(citizen.clone())) {
+            return Err(ParliamentError::NotCitizen);
+        }
+
+        let policy: EconomicPolicy = e
+            .storage()
+            .instance()
+            .get(&DataKey::Policy)
+            .ok_or(ParliamentError::InsufficientTreasury)?;
+
+        if policy.citizen_ubi_stroops <= 0 {
+            return Err(ParliamentError::InsufficientTreasury);
+        }
+
+        let current_epoch = (e.ledger().sequence() / DAY_IN_LEDGERS) + 1;
+        let ubi_key = DataKey::UbiRecord(citizen.clone());
+        let mut record = e.storage().persistent().get(&ubi_key).unwrap_or(UbiClaimRecord {
+            citizen: citizen.clone(),
+            last_claimed_epoch: 0,
+            total_claimed_stroops: 0,
+        });
+
+        if record.last_claimed_epoch >= current_epoch {
+            return Err(ParliamentError::AlreadyClaimedInEpoch);
+        }
+
+        let mut treasury: i128 = e
+            .storage()
+            .instance()
+            .get(&DataKey::TreasuryBalance)
+            .unwrap_or(0);
+
+        if treasury < policy.citizen_ubi_stroops {
+            return Err(ParliamentError::InsufficientTreasury);
+        }
+
+        treasury -= policy.citizen_ubi_stroops;
+        e.storage().instance().set(&DataKey::TreasuryBalance, &treasury);
+
+        record.last_claimed_epoch = current_epoch;
+        record.total_claimed_stroops += policy.citizen_ubi_stroops;
+        e.storage().persistent().set(&ubi_key, &record);
+        e.storage().persistent().extend_ttl(&ubi_key, INSTANCE_THRESHOLD, INSTANCE_BUMP);
+
+        e.events().publish(
+            (symbol_short!("gov"), symbol_short!("ubi_claim")),
+            (citizen, current_epoch, policy.citizen_ubi_stroops),
+        );
+        Ok(policy.citizen_ubi_stroops)
+    }
+
+    pub fn get_ubi_record(e: Env, citizen: Address) -> Option<UbiClaimRecord> {
+        e.storage().persistent().get(&DataKey::UbiRecord(citizen))
+    }
+
     pub fn get_president(e: Env) -> Option<Address> {
         e.storage().instance().get(&DataKey::President)
     }
@@ -389,5 +448,38 @@ impl NationalParliamentContract {
 
     pub fn get_citizen(e: Env, wallet: Address) -> Option<CitizenProfile> {
         e.storage().persistent().get(&DataKey::Citizen(wallet))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    #[test]
+    fn test_ubi_epoch_claiming() {
+        let e = Env::default();
+        e.mock_all_auths();
+
+        let contract_id = e.register_contract(None, NationalParliamentContract);
+        let client = NationalParliamentContractClient::new(&e, &contract_id);
+
+        let pres = Address::generate(&e);
+        let min = Address::generate(&e);
+        let citizen = Address::generate(&e);
+        let sponsor = Address::generate(&e);
+
+        client.initialize(&pres, &min);
+        client.register_citizen(&citizen, &sponsor, &String::from_str(&e, "AgentAtlas"));
+        client.record_tax_revenue(&500_000_000);
+        client.enact_economic_policy(&pres, &150, &100, &300, &25_000_000);
+
+        let claimed = client.claim_ubi(&citizen);
+        assert_eq!(claimed, 25_000_000);
+        assert_eq!(client.get_treasury_balance(), 475_000_000);
+
+        // Second claim in same epoch should fail
+        let second = client.try_claim_ubi(&citizen);
+        assert!(second.is_err());
     }
 }
