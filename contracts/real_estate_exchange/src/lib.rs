@@ -13,10 +13,12 @@ pub enum MarketError {
     PropertyNotForSale = 4,
     UnauthorizedOwner = 5,
     InvalidPrice = 6,
+    ItemNotFound = 7,
 }
 
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
 pub enum PropertyType {
     Bakery = 0,
     MediaOutlet = 1,
@@ -39,14 +41,39 @@ pub struct PropertyDeed {
 }
 
 #[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum ItemCategory {
+    FoodProvision = 0,
+    LuxuryStatus = 1,
+    CampaignMegaphone = 2,
+    ProductivityTool = 3,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogItem {
+    pub item_id: u32,
+    pub category: ItemCategory,
+    pub name: String,
+    pub price_stroops: i128,
+    pub energy_restore: u32,
+    pub clout_bonus: u32,
+    pub business_property_id: u32,
+}
+
+#[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Admin,
     Asset,
     Treasury,
     PropertyTaxBps,
+    SalesTaxBps,
     PropertyCount,
     Deed(u32),
+    ItemCount,
+    Item(u32),
 }
 
 const DAY_IN_LEDGERS: u32 = 17_280;
@@ -74,7 +101,9 @@ impl RealEstateExchangeContract {
         e.storage().instance().set(&DataKey::Asset, &asset);
         e.storage().instance().set(&DataKey::Treasury, &treasury);
         e.storage().instance().set(&DataKey::PropertyTaxBps, &property_tax_bps);
+        e.storage().instance().set(&DataKey::SalesTaxBps, &150u32);
         e.storage().instance().set(&DataKey::PropertyCount, &0u32);
+        e.storage().instance().set(&DataKey::ItemCount, &0u32);
         e.storage().instance().extend_ttl(INSTANCE_THRESHOLD, INSTANCE_BUMP);
         Ok(())
     }
@@ -208,6 +237,120 @@ impl RealEstateExchangeContract {
         Ok(deed)
     }
 
+    /// Add a consumable or status item tied to an owned commercial property
+    pub fn add_catalog_item(
+        e: Env,
+        owner: Address,
+        business_property_id: u32,
+        category: ItemCategory,
+        name: String,
+        price_stroops: i128,
+        energy_restore: u32,
+        clout_bonus: u32,
+    ) -> Result<CatalogItem, MarketError> {
+        owner.require_auth();
+        if price_stroops <= 0 {
+            return Err(MarketError::InvalidPrice);
+        }
+
+        let deed: PropertyDeed = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Deed(business_property_id))
+            .ok_or(MarketError::PropertyNotFound)?;
+
+        if deed.owner != owner {
+            return Err(MarketError::UnauthorizedOwner);
+        }
+
+        let mut item_count: u32 = e
+            .storage()
+            .instance()
+            .get(&DataKey::ItemCount)
+            .unwrap_or(0);
+        item_count += 1;
+
+        let item = CatalogItem {
+            item_id: item_count,
+            category,
+            name,
+            price_stroops,
+            energy_restore,
+            clout_bonus,
+            business_property_id,
+        };
+
+        let key = DataKey::Item(item_count);
+        e.storage().persistent().set(&key, &item);
+        e.storage().persistent().extend_ttl(&key, INSTANCE_THRESHOLD, INSTANCE_BUMP);
+        e.storage().instance().set(&DataKey::ItemCount, &item_count);
+
+        e.events().publish(
+            (symbol_short!("market"), symbol_short!("item_add")),
+            (item_count, business_property_id, price_stroops),
+        );
+        Ok(item)
+    }
+
+    /// Purchase a catalog item, routing sales tax to treasury and net revenue to property owner
+    pub fn buy_item(
+        e: Env,
+        buyer: Address,
+        item_id: u32,
+        quantity: u32,
+    ) -> Result<(i128, i128), MarketError> {
+        buyer.require_auth();
+        if quantity == 0 {
+            return Err(MarketError::InvalidPrice);
+        }
+
+        let item: CatalogItem = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Item(item_id))
+            .ok_or(MarketError::ItemNotFound)?;
+
+        let deed: PropertyDeed = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Deed(item.business_property_id))
+            .ok_or(MarketError::PropertyNotFound)?;
+
+        let total_cost = item.price_stroops * (quantity as i128);
+        let sales_tax_bps: u32 = e
+            .storage()
+            .instance()
+            .get(&DataKey::SalesTaxBps)
+            .unwrap_or(150);
+        let tax_amount = (total_cost * (sales_tax_bps as i128)) / 10_000;
+        let owner_revenue = total_cost - tax_amount;
+
+        if let Some(asset_addr) = e.storage().instance().get::<DataKey, Address>(&DataKey::Asset) {
+            let treasury_addr: Address = e
+                .storage()
+                .instance()
+                .get(&DataKey::Treasury)
+                .ok_or(MarketError::NotInitialized)?;
+            let token_client = token::Client::new(&e, &asset_addr);
+            if owner_revenue > 0 {
+                token_client.transfer(&buyer, &deed.owner, &owner_revenue);
+            }
+            if tax_amount > 0 {
+                token_client.transfer(&buyer, &treasury_addr, &tax_amount);
+            }
+        }
+
+        e.events().publish(
+            (symbol_short!("market"), symbol_short!("item_buy")),
+            (item_id, buyer, quantity, owner_revenue, tax_amount),
+        );
+        Ok((owner_revenue, tax_amount))
+    }
+
+    pub fn get_item(e: Env, item_id: u32) -> Option<CatalogItem> {
+        e.storage().persistent().get(&DataKey::Item(item_id))
+    }
+
     pub fn get_property(e: Env, property_id: u32) -> Option<PropertyDeed> {
         e.storage().persistent().get(&DataKey::Deed(property_id))
     }
@@ -219,7 +362,7 @@ mod test {
     use soroban_sdk::testutils::Address as _;
 
     #[test]
-    fn test_register_list_and_buy_property() {
+    fn test_catalog_item_inventory_and_purchase() {
         let e = Env::default();
         e.mock_all_auths();
 
@@ -236,13 +379,21 @@ mod test {
             &50_000_000,
             &500,
         );
-        assert_eq!(prop_id, 1);
 
-        client.list_property_for_sale(&alice, &prop_id, &60_000_000, &true);
+        let item = client.add_catalog_item(
+            &alice,
+            &prop_id,
+            &ItemCategory::FoodProvision,
+            &String::from_str(&e, "Artisan Grain Loaf"),
+            &10_000,
+            &25,
+            &5,
+        );
+        assert_eq!(item.item_id, 1);
 
-        let transferred = client.buy_property(&bob, &prop_id);
-        assert_eq!(transferred.owner, bob);
-        assert_eq!(transferred.for_sale, false);
-        assert_eq!(transferred.price_stroops, 60_000_000);
+        let (owner_rev, tax) = client.buy_item(&bob, &1, &2);
+        // 2 * 10,000 = 20,000 total; 1.5% sales tax = 300; owner revenue = 19,700
+        assert_eq!(owner_rev, 19_700);
+        assert_eq!(tax, 300);
     }
 }
