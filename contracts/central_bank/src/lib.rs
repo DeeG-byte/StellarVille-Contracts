@@ -13,15 +13,17 @@ pub enum BankError {
     LoanLimitExceeded = 4,
     UnauthorizedNotGovernor = 5,
     InvalidRate = 6,
+    InsufficientReserves = 7,
 }
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
-    Governor, // Elected Finance Minister / Central Bank Governor Agent
+    Governor,
     Asset,
-    BaseInterestBps, // Base loan rate in basis points (e.g. 400 = 4.00%)
-    SavingsYieldBps, // Savings yield in basis points (e.g. 250 = 2.50%)
+    BaseInterestBps,
+    SavingsYieldBps,
+    MinReserveRatioBps,
     TotalDeposits,
     TotalBorrows,
     Account(Address),
@@ -34,6 +36,14 @@ pub struct AccountRecord {
     pub debt: i128,
     pub last_accrual_ledger: u32,
     pub credit_score: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BankReserves {
+    pub total_deposits: i128,
+    pub total_borrows: i128,
+    pub min_reserve_ratio_bps: u32,
 }
 
 const DAY_IN_LEDGERS: u32 = 17_280;
@@ -61,6 +71,7 @@ impl CentralBankContract {
         e.storage().instance().set(&DataKey::Asset, &asset);
         e.storage().instance().set(&DataKey::BaseInterestBps, &base_interest_bps);
         e.storage().instance().set(&DataKey::SavingsYieldBps, &savings_yield_bps);
+        e.storage().instance().set(&DataKey::MinReserveRatioBps, &2000u32); // 20% default reserve ratio
         e.storage().instance().set(&DataKey::TotalDeposits, &0i128);
         e.storage().instance().set(&DataKey::TotalBorrows, &0i128);
 
@@ -70,7 +81,6 @@ impl CentralBankContract {
         Ok(())
     }
 
-    /// Elected Central Bank Governor / Finance Minister sets monetary policy interest rates
     pub fn set_monetary_rates(
         e: Env,
         governor: Address,
@@ -106,7 +116,6 @@ impl CentralBankContract {
         Ok(())
     }
 
-    /// Deposit XLM into the Central Bank to earn savings yield and boost credit score
     pub fn deposit(e: Env, from: Address, amount: i128) -> Result<(), BankError> {
         from.require_auth();
         if amount <= 0 {
@@ -122,6 +131,7 @@ impl CentralBankContract {
         });
 
         account.deposits += amount;
+        account.last_accrual_ledger = e.ledger().sequence();
         e.storage().persistent().set(&key, &account);
         e.storage()
             .persistent()
@@ -144,7 +154,81 @@ impl CentralBankContract {
         Ok(())
     }
 
-    /// Borrow XLM to buy real estate, start a business, or fund a presidential campaign
+    /// Withdraw savings with automatic yield accrual and minimum reserve ratio guard
+    pub fn withdraw(e: Env, depositor: Address, amount: i128) -> Result<(), BankError> {
+        depositor.require_auth();
+        if amount <= 0 {
+            return Err(BankError::InsufficientBalance);
+        }
+
+        let key = DataKey::Account(depositor.clone());
+        let mut account: AccountRecord = e
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(BankError::InsufficientBalance)?;
+
+        let current_ledger = e.ledger().sequence();
+        let elapsed_ledgers = current_ledger.saturating_sub(account.last_accrual_ledger) as i128;
+        let savings_bps: u32 = e
+            .storage()
+            .instance()
+            .get(&DataKey::SavingsYieldBps)
+            .unwrap_or(250);
+
+        let accrued_yield = (account.deposits * (savings_bps as i128) * elapsed_ledgers)
+            / (10_000 * (DAY_IN_LEDGERS as i128));
+        account.deposits += accrued_yield;
+        account.last_accrual_ledger = current_ledger;
+
+        if amount > account.deposits {
+            return Err(BankError::InsufficientBalance);
+        }
+
+        let mut total_deposits: i128 = e
+            .storage()
+            .instance()
+            .get(&DataKey::TotalDeposits)
+            .unwrap_or(0);
+        total_deposits += accrued_yield;
+
+        let total_borrows: i128 = e
+            .storage()
+            .instance()
+            .get(&DataKey::TotalBorrows)
+            .unwrap_or(0);
+        let min_reserve_bps: u32 = e
+            .storage()
+            .instance()
+            .get(&DataKey::MinReserveRatioBps)
+            .unwrap_or(2000);
+
+        let new_total_deposits = total_deposits - amount;
+        let liquid_after = new_total_deposits - total_borrows;
+        if liquid_after < 0
+            || (new_total_deposits > 0
+                && liquid_after * 10_000 < new_total_deposits * (min_reserve_bps as i128))
+        {
+            return Err(BankError::InsufficientReserves);
+        }
+
+        account.deposits -= amount;
+        e.storage().persistent().set(&key, &account);
+        e.storage()
+            .persistent()
+            .extend_ttl(&key, INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+
+        e.storage()
+            .instance()
+            .set(&DataKey::TotalDeposits, &new_total_deposits);
+
+        e.events().publish(
+            (symbol_short!("bank"), symbol_short!("withdraw")),
+            (depositor, amount, account.deposits),
+        );
+        Ok(())
+    }
+
     pub fn borrow(e: Env, borrower: Address, amount: i128) -> Result<(), BankError> {
         borrower.require_auth();
         if amount <= 0 {
@@ -183,7 +267,6 @@ impl CentralBankContract {
         Ok(())
     }
 
-    /// Repay debt and increase agent credit score
     pub fn repay(e: Env, borrower: Address, amount: i128) -> Result<(), BankError> {
         borrower.require_auth();
         let key = DataKey::Account(borrower.clone());
@@ -212,6 +295,18 @@ impl CentralBankContract {
         e.storage().persistent().get(&DataKey::Account(account))
     }
 
+    pub fn get_reserves(e: Env) -> BankReserves {
+        BankReserves {
+            total_deposits: e.storage().instance().get(&DataKey::TotalDeposits).unwrap_or(0),
+            total_borrows: e.storage().instance().get(&DataKey::TotalBorrows).unwrap_or(0),
+            min_reserve_ratio_bps: e
+                .storage()
+                .instance()
+                .get(&DataKey::MinReserveRatioBps)
+                .unwrap_or(2000),
+        }
+    }
+
     pub fn get_rates(e: Env) -> (u32, u32) {
         let borrow_bps: u32 = e
             .storage()
@@ -224,5 +319,40 @@ impl CentralBankContract {
             .get(&DataKey::SavingsYieldBps)
             .unwrap_or(250);
         (borrow_bps, savings_bps)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    #[test]
+    fn test_withdraw_and_reserve_ratio_guard() {
+        let e = Env::default();
+        e.mock_all_auths();
+
+        let contract_id = e.register_contract(None, CentralBankContract);
+        let client = CentralBankContractClient::new(&e, &contract_id);
+
+        let gov = Address::generate(&e);
+        let asset = Address::generate(&e);
+        let alice = Address::generate(&e);
+        let bob = Address::generate(&e);
+
+        client.initialize(&gov, &asset, &400, &250);
+        client.deposit(&alice, &1000);
+
+        // Valid partial withdrawal with 0 borrows
+        client.withdraw(&alice, &200);
+        let acct = client.get_account(&alice).unwrap();
+        assert_eq!(acct.deposits, 800);
+
+        // Bob borrows 600 out of 800 total deposits (leaving 200 liquid = 25% reserve)
+        client.borrow(&bob, &600);
+
+        // Withdrawing 100 would leave 700 deposits and 100 liquid (14.2% < 20% min reserve), should fail
+        let res = client.try_withdraw(&alice, &100);
+        assert!(res.is_err());
     }
 }
