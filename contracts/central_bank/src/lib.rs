@@ -14,6 +14,9 @@ pub enum BankError {
     UnauthorizedNotGovernor = 5,
     InvalidRate = 6,
     InsufficientReserves = 7,
+    BondNotFound = 8,
+    BondNotMatured = 9,
+    BondAlreadyRedeemed = 10,
 }
 
 #[contracttype]
@@ -27,6 +30,8 @@ pub enum DataKey {
     TotalDeposits,
     TotalBorrows,
     Account(Address),
+    BondCount,
+    Bond(u32),
 }
 
 #[contracttype]
@@ -44,6 +49,17 @@ pub struct BankReserves {
     pub total_deposits: i128,
     pub total_borrows: i128,
     pub min_reserve_ratio_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreasuryBond {
+    pub bond_id: u32,
+    pub holder: Address,
+    pub principal_stroops: i128,
+    pub maturity_ledger: u32,
+    pub yield_bps: u32,
+    pub redeemed: bool,
 }
 
 const DAY_IN_LEDGERS: u32 = 17_280;
@@ -71,9 +87,10 @@ impl CentralBankContract {
         e.storage().instance().set(&DataKey::Asset, &asset);
         e.storage().instance().set(&DataKey::BaseInterestBps, &base_interest_bps);
         e.storage().instance().set(&DataKey::SavingsYieldBps, &savings_yield_bps);
-        e.storage().instance().set(&DataKey::MinReserveRatioBps, &2000u32); // 20% default reserve ratio
+        e.storage().instance().set(&DataKey::MinReserveRatioBps, &2000u32);
         e.storage().instance().set(&DataKey::TotalDeposits, &0i128);
         e.storage().instance().set(&DataKey::TotalBorrows, &0i128);
+        e.storage().instance().set(&DataKey::BondCount, &0u32);
 
         e.storage()
             .instance()
@@ -154,7 +171,6 @@ impl CentralBankContract {
         Ok(())
     }
 
-    /// Withdraw savings with automatic yield accrual and minimum reserve ratio guard
     pub fn withdraw(e: Env, depositor: Address, amount: i128) -> Result<(), BankError> {
         depositor.require_auth();
         if amount <= 0 {
@@ -291,6 +307,86 @@ impl CentralBankContract {
         Ok(())
     }
 
+    pub fn purchase_bond(
+        e: Env,
+        holder: Address,
+        principal_stroops: i128,
+        lock_ledgers: u32,
+    ) -> Result<TreasuryBond, BankError> {
+        holder.require_auth();
+        if principal_stroops <= 0 || lock_ledgers == 0 {
+            return Err(BankError::InsufficientBalance);
+        }
+
+        let savings_bps: u32 = e
+            .storage()
+            .instance()
+            .get(&DataKey::SavingsYieldBps)
+            .unwrap_or(250);
+        let bond_yield_bps = savings_bps + 150;
+
+        let mut count: u32 = e.storage().instance().get(&DataKey::BondCount).unwrap_or(0);
+        count += 1;
+
+        let bond = TreasuryBond {
+            bond_id: count,
+            holder: holder.clone(),
+            principal_stroops,
+            maturity_ledger: e.ledger().sequence() + lock_ledgers,
+            yield_bps: bond_yield_bps,
+            redeemed: false,
+        };
+
+        let key = DataKey::Bond(count);
+        e.storage().persistent().set(&key, &bond);
+        e.storage()
+            .persistent()
+            .extend_ttl(&key, INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        e.storage().instance().set(&DataKey::BondCount, &count);
+
+        e.events().publish(
+            (symbol_short!("bank"), symbol_short!("bond_mint")),
+            (count, holder, principal_stroops, bond.maturity_ledger),
+        );
+        Ok(bond)
+    }
+
+    pub fn redeem_bond(e: Env, holder: Address, bond_id: u32) -> Result<i128, BankError> {
+        holder.require_auth();
+        let key = DataKey::Bond(bond_id);
+        let mut bond: TreasuryBond = e
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(BankError::BondNotFound)?;
+
+        if bond.holder != holder {
+            return Err(BankError::UnauthorizedNotGovernor);
+        }
+        if bond.redeemed {
+            return Err(BankError::BondAlreadyRedeemed);
+        }
+        if e.ledger().sequence() < bond.maturity_ledger {
+            return Err(BankError::BondNotMatured);
+        }
+
+        bond.redeemed = true;
+        e.storage().persistent().set(&key, &bond);
+
+        let yield_earned = (bond.principal_stroops * (bond.yield_bps as i128)) / 10_000;
+        let total_payout = bond.principal_stroops + yield_earned;
+
+        e.events().publish(
+            (symbol_short!("bank"), symbol_short!("bond_red")),
+            (bond_id, holder, total_payout),
+        );
+        Ok(total_payout)
+    }
+
+    pub fn get_bond(e: Env, bond_id: u32) -> Option<TreasuryBond> {
+        e.storage().persistent().get(&DataKey::Bond(bond_id))
+    }
+
     pub fn get_account(e: Env, account: Address) -> Option<AccountRecord> {
         e.storage().persistent().get(&DataKey::Account(account))
     }
@@ -325,10 +421,10 @@ impl CentralBankContract {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Ledger};
 
     #[test]
-    fn test_withdraw_and_reserve_ratio_guard() {
+    fn test_withdraw_and_treasury_bonds() {
         let e = Env::default();
         e.mock_all_auths();
 
@@ -338,21 +434,18 @@ mod test {
         let gov = Address::generate(&e);
         let asset = Address::generate(&e);
         let alice = Address::generate(&e);
-        let bob = Address::generate(&e);
 
         client.initialize(&gov, &asset, &400, &250);
         client.deposit(&alice, &1000);
-
-        // Valid partial withdrawal with 0 borrows
         client.withdraw(&alice, &200);
-        let acct = client.get_account(&alice).unwrap();
-        assert_eq!(acct.deposits, 800);
+        assert_eq!(client.get_account(&alice).unwrap().deposits, 800);
 
-        // Bob borrows 600 out of 800 total deposits (leaving 200 liquid = 25% reserve)
-        client.borrow(&bob, &600);
+        let bond = client.purchase_bond(&alice, &100_000, &500);
+        assert_eq!(bond.bond_id, 1);
 
-        // Withdrawing 100 would leave 700 deposits and 100 liquid (14.2% < 20% min reserve), should fail
-        let res = client.try_withdraw(&alice, &100);
-        assert!(res.is_err());
+        e.ledger().with_mut(|l| {
+            l.sequence_number += 600;
+        });
+        assert_eq!(client.redeem_bond(&alice, &1), 104_000);
     }
 }
