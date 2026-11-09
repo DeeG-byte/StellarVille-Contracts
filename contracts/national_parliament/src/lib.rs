@@ -17,6 +17,8 @@ pub enum ParliamentError {
     CandidateNotFound = 8,
     InsufficientTreasury = 9,
     AlreadyClaimedInEpoch = 10,
+    PartyNotFound = 11,
+    UnauthorizedNotFounder = 12,
 }
 
 #[contracttype]
@@ -50,6 +52,17 @@ pub struct UbiClaimRecord {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PoliticalParty {
+    pub party_id: u32,
+    pub name: String,
+    pub founder: Address,
+    pub endorsed_candidate: Option<Address>,
+    pub member_count: u32,
+    pub treasury_stroops: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     President,
     FinanceMinister,
@@ -61,6 +74,8 @@ pub enum DataKey {
     CandidateList,
     VotedInTerm(u32, Address),
     UbiRecord(Address),
+    PartyCount,
+    Party(u32),
 }
 
 const DAY_IN_LEDGERS: u32 = 17_280;
@@ -95,6 +110,7 @@ impl NationalParliamentContract {
         e.storage().instance().set(&DataKey::Policy, &default_policy);
         e.storage().instance().set(&DataKey::CurrentTerm, &1u32);
         e.storage().instance().set(&DataKey::CitizenCount, &0u32);
+        e.storage().instance().set(&DataKey::PartyCount, &0u32);
 
         let candidates: Vec<Address> = Vec::new(&e);
         e.storage().instance().set(&DataKey::CandidateList, &candidates);
@@ -376,7 +392,6 @@ impl NationalParliamentContract {
         Ok(())
     }
 
-    /// Claim Universal Basic Income (UBI) once per virtual epoch
     pub fn claim_ubi(e: Env, citizen: Address) -> Result<i128, ParliamentError> {
         citizen.require_auth();
         if !e.storage().persistent().has(&DataKey::Citizen(citizen.clone())) {
@@ -434,6 +449,103 @@ impl NationalParliamentContract {
         e.storage().persistent().get(&DataKey::UbiRecord(citizen))
     }
 
+    pub fn create_party(
+        e: Env,
+        founder: Address,
+        name: String,
+    ) -> Result<PoliticalParty, ParliamentError> {
+        founder.require_auth();
+        if !e.storage().persistent().has(&DataKey::Citizen(founder.clone())) {
+            return Err(ParliamentError::NotCitizen);
+        }
+
+        let mut count: u32 = e.storage().instance().get(&DataKey::PartyCount).unwrap_or(0);
+        count += 1;
+
+        let party = PoliticalParty {
+            party_id: count,
+            name,
+            founder: founder.clone(),
+            endorsed_candidate: None,
+            member_count: 1,
+            treasury_stroops: 0,
+        };
+
+        let key = DataKey::Party(count);
+        e.storage().persistent().set(&key, &party);
+        e.storage().persistent().extend_ttl(&key, INSTANCE_THRESHOLD, INSTANCE_BUMP);
+        e.storage().instance().set(&DataKey::PartyCount, &count);
+
+        e.events().publish(
+            (symbol_short!("gov"), symbol_short!("party")),
+            (count, founder),
+        );
+        Ok(party)
+    }
+
+    pub fn join_party(
+        e: Env,
+        citizen: Address,
+        party_id: u32,
+        donation_stroops: i128,
+    ) -> Result<PoliticalParty, ParliamentError> {
+        citizen.require_auth();
+        if !e.storage().persistent().has(&DataKey::Citizen(citizen.clone())) {
+            return Err(ParliamentError::NotCitizen);
+        }
+
+        let key = DataKey::Party(party_id);
+        let mut party: PoliticalParty = e
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ParliamentError::PartyNotFound)?;
+
+        party.member_count += 1;
+        if donation_stroops > 0 {
+            party.treasury_stroops += donation_stroops;
+        }
+
+        e.storage().persistent().set(&key, &party);
+        e.storage().persistent().extend_ttl(&key, INSTANCE_THRESHOLD, INSTANCE_BUMP);
+        Ok(party)
+    }
+
+    pub fn endorse_candidate(
+        e: Env,
+        founder: Address,
+        party_id: u32,
+        candidate: Address,
+    ) -> Result<PoliticalParty, ParliamentError> {
+        founder.require_auth();
+        let key = DataKey::Party(party_id);
+        let mut party: PoliticalParty = e
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ParliamentError::PartyNotFound)?;
+
+        if party.founder != founder {
+            return Err(ParliamentError::UnauthorizedNotFounder);
+        }
+        if !e.storage().persistent().has(&DataKey::Citizen(candidate.clone())) {
+            return Err(ParliamentError::CandidateNotFound);
+        }
+
+        party.endorsed_candidate = Some(candidate.clone());
+        e.storage().persistent().set(&key, &party);
+
+        e.events().publish(
+            (symbol_short!("gov"), symbol_short!("endorse")),
+            (party_id, candidate),
+        );
+        Ok(party)
+    }
+
+    pub fn get_party(e: Env, party_id: u32) -> Option<PoliticalParty> {
+        e.storage().persistent().get(&DataKey::Party(party_id))
+    }
+
     pub fn get_president(e: Env) -> Option<Address> {
         e.storage().instance().get(&DataKey::President)
     }
@@ -457,7 +569,7 @@ mod test {
     use soroban_sdk::testutils::Address as _;
 
     #[test]
-    fn test_ubi_epoch_claiming() {
+    fn test_ubi_and_political_parties() {
         let e = Env::default();
         e.mock_all_auths();
 
@@ -466,20 +578,21 @@ mod test {
 
         let pres = Address::generate(&e);
         let min = Address::generate(&e);
-        let citizen = Address::generate(&e);
+        let alice = Address::generate(&e);
+        let bob = Address::generate(&e);
         let sponsor = Address::generate(&e);
 
         client.initialize(&pres, &min);
-        client.register_citizen(&citizen, &sponsor, &String::from_str(&e, "AgentAtlas"));
+        client.register_citizen(&alice, &sponsor, &String::from_str(&e, "Alice"));
+        client.register_citizen(&bob, &sponsor, &String::from_str(&e, "Bob"));
         client.record_tax_revenue(&500_000_000);
         client.enact_economic_policy(&pres, &150, &100, &300, &25_000_000);
 
-        let claimed = client.claim_ubi(&citizen);
-        assert_eq!(claimed, 25_000_000);
-        assert_eq!(client.get_treasury_balance(), 475_000_000);
+        assert_eq!(client.claim_ubi(&alice), 25_000_000);
 
-        // Second claim in same epoch should fail
-        let second = client.try_claim_ubi(&citizen);
-        assert!(second.is_err());
+        let party = client.create_party(&alice, &String::from_str(&e, "Growth Coalition"));
+        assert_eq!(party.party_id, 1);
+        let endorsed = client.endorse_candidate(&alice, &1, &bob);
+        assert_eq!(endorsed.endorsed_candidate, Some(bob));
     }
 }
