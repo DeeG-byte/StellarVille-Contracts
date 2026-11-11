@@ -14,6 +14,12 @@ pub enum ArenaError {
     RoundNotFound = 5,
     RoundNotEnded = 6,
     RoundAlreadyDrawn = 7,
+    MarketAlreadyExists = 8,
+    MarketNotFound = 9,
+    MarketAlreadyResolved = 10,
+    MarketNotResolved = 11,
+    NoWinningStake = 12,
+    AlreadyClaimed = 13,
 }
 
 #[contracttype]
@@ -51,6 +57,25 @@ pub struct LotteryRound {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ElectionMarket {
+    pub term: u32,
+    pub total_pool_stroops: i128,
+    pub resolved: bool,
+    pub winning_candidate: Option<Address>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CandidateBet {
+    pub bettor: Address,
+    pub term: u32,
+    pub candidate: Address,
+    pub stake_stroops: i128,
+    pub claimed: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HouseLiquidityPool {
     pub total_liquidity_stroops: i128,
     pub total_shares: i128,
@@ -76,6 +101,8 @@ pub enum DataKey {
     PoolState,
     LpRecord(Address),
     Lottery(u32),
+    ElectionMarket(u32),
+    Bet(u32, Address),
 }
 
 #[contract]
@@ -299,6 +326,146 @@ impl AgentArenaContract {
         e.storage().instance().get(&DataKey::HouseReserve).unwrap_or(0)
     }
 
+    pub fn init_election_market(e: Env, term: u32) -> Result<(), ArenaError> {
+        let key = DataKey::ElectionMarket(term);
+        if e.storage().persistent().has(&key) {
+            return Err(ArenaError::MarketAlreadyExists);
+        }
+        let market = ElectionMarket {
+            term,
+            total_pool_stroops: 0,
+            resolved: false,
+            winning_candidate: None,
+        };
+        e.storage().persistent().set(&key, &market);
+        Ok(())
+    }
+
+    pub fn bet_on_election(
+        e: Env,
+        bettor: Address,
+        term: u32,
+        candidate: Address,
+        stake_stroops: i128,
+    ) -> Result<(), ArenaError> {
+        bettor.require_auth();
+        if stake_stroops <= 0 {
+            return Err(ArenaError::InvalidWagerAmount);
+        }
+        let m_key = DataKey::ElectionMarket(term);
+        let mut market: ElectionMarket = e
+            .storage()
+            .persistent()
+            .get(&m_key)
+            .ok_or(ArenaError::MarketNotFound)?;
+
+        if market.resolved {
+            return Err(ArenaError::MarketAlreadyResolved);
+        }
+        market.total_pool_stroops += stake_stroops;
+        e.storage().persistent().set(&m_key, &market);
+
+        let bet_key = DataKey::Bet(term, bettor.clone());
+        let mut bet = e
+            .storage()
+            .persistent()
+            .get(&bet_key)
+            .unwrap_or(CandidateBet {
+                bettor: bettor.clone(),
+                term,
+                candidate: candidate.clone(),
+                stake_stroops: 0,
+                claimed: false,
+            });
+        bet.candidate = candidate.clone();
+        bet.stake_stroops += stake_stroops;
+        e.storage().persistent().set(&bet_key, &bet);
+
+        e.events().publish(
+            (symbol_short!("arena"), symbol_short!("bet_term")),
+            (term, bettor, candidate, stake_stroops),
+        );
+        Ok(())
+    }
+
+    pub fn resolve_election_market(
+        e: Env,
+        term: u32,
+        winning_candidate: Address,
+    ) -> Result<(), ArenaError> {
+        let m_key = DataKey::ElectionMarket(term);
+        let mut market: ElectionMarket = e
+            .storage()
+            .persistent()
+            .get(&m_key)
+            .ok_or(ArenaError::MarketNotFound)?;
+
+        if market.resolved {
+            return Err(ArenaError::MarketAlreadyResolved);
+        }
+        market.resolved = true;
+        market.winning_candidate = Some(winning_candidate.clone());
+        e.storage().persistent().set(&m_key, &market);
+
+        e.events().publish(
+            (symbol_short!("arena"), symbol_short!("mkt_res")),
+            (term, winning_candidate),
+        );
+        Ok(())
+    }
+
+    pub fn claim_prediction_winnings(
+        e: Env,
+        bettor: Address,
+        term: u32,
+    ) -> Result<i128, ArenaError> {
+        bettor.require_auth();
+        let m_key = DataKey::ElectionMarket(term);
+        let market: ElectionMarket = e
+            .storage()
+            .persistent()
+            .get(&m_key)
+            .ok_or(ArenaError::MarketNotFound)?;
+
+        if !market.resolved {
+            return Err(ArenaError::MarketNotResolved);
+        }
+        let winner = market.winning_candidate.ok_or(ArenaError::MarketNotResolved)?;
+
+        let bet_key = DataKey::Bet(term, bettor.clone());
+        let mut bet: CandidateBet = e
+            .storage()
+            .persistent()
+            .get(&bet_key)
+            .ok_or(ArenaError::NoWinningStake)?;
+
+        if bet.claimed {
+            return Err(ArenaError::AlreadyClaimed);
+        }
+        if bet.candidate != winner {
+            return Err(ArenaError::NoWinningStake);
+        }
+
+        bet.claimed = true;
+        e.storage().persistent().set(&bet_key, &bet);
+
+        let payout = (bet.stake_stroops * 180) / 100;
+        e.events().publish(
+            (symbol_short!("arena"), symbol_short!("bet_claim")),
+            (term, bettor, payout),
+        );
+        Ok(payout)
+    }
+
+    pub fn get_election_market(e: Env, term: u32) -> Option<ElectionMarket> {
+        e.storage().persistent().get(&DataKey::ElectionMarket(term))
+    }
+
+    pub fn get_candidate_bet(e: Env, term: u32, bettor: Address) -> Option<CandidateBet> {
+        e.storage().persistent().get(&DataKey::Bet(term, bettor))
+    }
+
+
     pub fn init_lottery_round(
         e: Env,
         round_id: u32,
@@ -439,6 +606,36 @@ mod test {
 
         let round_after = client.get_lottery_round(&1).unwrap();
         assert!(round_after.winner.is_some());
+    }
+
+
+    #[test]
+    fn test_election_prediction_market() {
+        let e = Env::default();
+        e.mock_all_auths();
+
+        let contract_id = e.register_contract(None, AgentArenaContract);
+        let client = AgentArenaContractClient::new(&e, &contract_id);
+
+        let alice = Address::generate(&e);
+        let bob = Address::generate(&e);
+        let candidate_a = Address::generate(&e);
+        let candidate_b = Address::generate(&e);
+
+        client.init_election_market(&1);
+        client.bet_on_election(&alice, &1, &candidate_a, &100_000);
+        client.bet_on_election(&bob, &1, &candidate_b, &100_000);
+
+        let market = client.get_election_market(&1).unwrap();
+        assert_eq!(market.total_pool_stroops, 200_000);
+        assert!(!market.resolved);
+
+        client.resolve_election_market(&1, &candidate_a);
+
+        assert!(client.try_claim_prediction_winnings(&bob, &1).is_err());
+
+        let winnings = client.claim_prediction_winnings(&alice, &1);
+        assert_eq!(winnings, 180_000);
     }
 
 }
