@@ -41,6 +41,15 @@ pub struct PropertyDeed {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PropertyRevenuePool {
+    pub property_id: u32,
+    pub accumulated_revenue: i128,
+    pub total_claimed: i128,
+    pub last_claim_ledger: u32,
+}
+
+#[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum ItemCategory {
@@ -74,6 +83,7 @@ pub enum DataKey {
     Deed(u32),
     ItemCount,
     Item(u32),
+    RevenuePool(u32),
 }
 
 const DAY_IN_LEDGERS: u32 = 17_280;
@@ -340,6 +350,20 @@ impl RealEstateExchangeContract {
             }
         }
 
+        let pool_key = DataKey::RevenuePool(item.business_property_id);
+        let mut pool: PropertyRevenuePool = e
+            .storage()
+            .persistent()
+            .get(&pool_key)
+            .unwrap_or(PropertyRevenuePool {
+                property_id: item.business_property_id,
+                accumulated_revenue: 0,
+                total_claimed: 0,
+                last_claim_ledger: e.ledger().sequence(),
+            });
+        pool.accumulated_revenue += owner_revenue;
+        e.storage().persistent().set(&pool_key, &pool);
+
         e.events().publish(
             (symbol_short!("market"), symbol_short!("item_buy")),
             (item_id, buyer, quantity, owner_revenue, tax_amount),
@@ -354,6 +378,57 @@ impl RealEstateExchangeContract {
     pub fn get_property(e: Env, property_id: u32) -> Option<PropertyDeed> {
         e.storage().persistent().get(&DataKey::Deed(property_id))
     }
+
+    pub fn claim_property_yield(
+        e: Env,
+        owner: Address,
+        property_id: u32,
+    ) -> Result<i128, MarketError> {
+        owner.require_auth();
+        let deed: PropertyDeed = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Deed(property_id))
+            .ok_or(MarketError::PropertyNotFound)?;
+        if deed.owner != owner {
+            return Err(MarketError::UnauthorizedOwner);
+        }
+        let pool_key = DataKey::RevenuePool(property_id);
+        let mut pool: PropertyRevenuePool = e
+            .storage()
+            .persistent()
+            .get(&pool_key)
+            .unwrap_or(PropertyRevenuePool {
+                property_id,
+                accumulated_revenue: 0,
+                total_claimed: 0,
+                last_claim_ledger: e.ledger().sequence(),
+            });
+        let claimable = pool.accumulated_revenue;
+        pool.accumulated_revenue = 0;
+        pool.total_claimed += claimable;
+        pool.last_claim_ledger = e.ledger().sequence();
+        e.storage().persistent().set(&pool_key, &pool);
+
+        e.events().publish(
+            (symbol_short!("market"), symbol_short!("claim_yd")),
+            (property_id, owner, claimable),
+        );
+        Ok(claimable)
+    }
+
+    pub fn get_revenue_pool(e: Env, property_id: u32) -> PropertyRevenuePool {
+        e.storage()
+            .persistent()
+            .get(&DataKey::RevenuePool(property_id))
+            .unwrap_or(PropertyRevenuePool {
+                property_id,
+                accumulated_revenue: 0,
+                total_claimed: 0,
+                last_claim_ledger: e.ledger().sequence(),
+            })
+    }
+
 }
 
 #[cfg(test)]
@@ -396,4 +471,47 @@ mod test {
         assert_eq!(owner_rev, 19_700);
         assert_eq!(tax, 300);
     }
+
+    #[test]
+    fn test_commercial_property_passive_yield_distribution() {
+        let e = Env::default();
+        e.mock_all_auths();
+
+        let contract_id = e.register_contract(None, RealEstateExchangeContract);
+        let client = RealEstateExchangeContractClient::new(&e, &contract_id);
+
+        let alice = Address::generate(&e);
+        let bob = Address::generate(&e);
+
+        let prop_id = client.register_property(
+            &alice,
+            &PropertyType::Bakery,
+            &String::from_str(&e, "Sunrise Bakery"),
+            &50_000_000,
+            &500,
+        );
+
+        client.add_catalog_item(
+            &alice,
+            &prop_id,
+            &ItemCategory::FoodProvision,
+            &String::from_str(&e, "Artisan Bread"),
+            &10_000,
+            &25,
+            &5,
+        );
+
+        client.buy_item(&bob, &1, &2);
+        let pool = client.get_revenue_pool(&prop_id);
+        assert_eq!(pool.accumulated_revenue, 19_700);
+        assert_eq!(pool.total_claimed, 0);
+
+        let claimed = client.claim_property_yield(&alice, &prop_id);
+        assert_eq!(claimed, 19_700);
+
+        let pool_after = client.get_revenue_pool(&prop_id);
+        assert_eq!(pool_after.accumulated_revenue, 0);
+        assert_eq!(pool_after.total_claimed, 19_700);
+    }
+
 }
