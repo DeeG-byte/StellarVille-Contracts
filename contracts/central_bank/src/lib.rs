@@ -17,6 +17,8 @@ pub enum BankError {
     BondNotFound = 8,
     BondNotMatured = 9,
     BondAlreadyRedeemed = 10,
+    AccountHealthy = 11,
+    OverdueThresholdNotReached = 12,
 }
 
 #[contracttype]
@@ -42,6 +44,16 @@ pub struct AccrualIndex {
     pub borrow_index_scaled: i128,
     pub savings_index_scaled: i128,
     pub last_update_ledger: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiquidationReceipt {
+    pub borrower: Address,
+    pub liquidator: Address,
+    pub debt_repaid: i128,
+    pub collateral_seized: i128,
+    pub new_credit_score: u32,
 }
 
 #[contracttype]
@@ -554,6 +566,58 @@ impl CentralBankContract {
             })
     }
 
+    
+    pub fn liquidate(
+        e: Env,
+        liquidator: Address,
+        borrower: Address,
+        repay_amount: i128,
+    ) -> Result<LiquidationReceipt, BankError> {
+        liquidator.require_auth();
+        let b_key = DataKey::Account(borrower.clone());
+        let mut borrower_acc: AccountRecord = e
+            .storage()
+            .persistent()
+            .get(&b_key)
+            .ok_or(BankError::InsufficientBalance)?;
+
+        let max_limit = Self::get_max_borrow_limit(e.clone(), borrower.clone());
+        if borrower_acc.debt <= max_limit {
+            return Err(BankError::AccountHealthy);
+        }
+
+        let actual_repay = if repay_amount > borrower_acc.debt {
+            borrower_acc.debt
+        } else {
+            repay_amount
+        };
+
+        borrower_acc.debt -= actual_repay;
+        let collateral_seized = (actual_repay * 105) / 100;
+        if borrower_acc.deposits >= collateral_seized {
+            borrower_acc.deposits -= collateral_seized;
+        } else {
+            borrower_acc.deposits = 0;
+        }
+
+        borrower_acc.credit_score = borrower_acc.credit_score.saturating_sub(100);
+        e.storage().persistent().set(&b_key, &borrower_acc);
+
+        let receipt = LiquidationReceipt {
+            borrower: borrower.clone(),
+            liquidator: liquidator.clone(),
+            debt_repaid: actual_repay,
+            collateral_seized,
+            new_credit_score: borrower_acc.credit_score,
+        };
+
+        e.events().publish(
+            (symbol_short!("bank"), symbol_short!("liquidate")),
+            (borrower, liquidator, actual_repay, collateral_seized),
+        );
+        Ok(receipt)
+    }
+
     pub fn get_rates(e: Env) -> (u32, u32) {
         let borrow_bps: u32 = e
             .storage()
@@ -621,6 +685,37 @@ mod test {
         let updated = client.accrue_interest();
         assert_eq!(updated.borrow_index_scaled, 1_400_000);
         assert_eq!(updated.savings_index_scaled, 1_250_000);
+    }
+
+
+    #[test]
+    fn test_defaulted_loan_liquidation() {
+        let e = Env::default();
+        e.mock_all_auths();
+
+        let contract_id = e.register_contract(None, CentralBankContract);
+        let client = CentralBankContractClient::new(&e, &contract_id);
+
+        let gov = Address::generate(&e);
+        let asset = Address::generate(&e);
+        let lender = Address::generate(&e);
+        let borrower = Address::generate(&e);
+        let liquidator = Address::generate(&e);
+
+        client.initialize(&gov, &asset, &400, &250);
+
+        client.deposit(&lender, &2_000_000);
+
+        client.deposit(&borrower, &100_000);
+        client.borrow(&borrower, &650_000);
+
+        assert!(client.try_liquidate(&liquidator, &borrower, &100_000).is_err());
+
+        client.set_credit_tier_config(&gov, &7500, &500, &400);
+
+        let receipt = client.liquidate(&liquidator, &borrower, &200_000);
+        assert_eq!(receipt.debt_repaid, 200_000);
+        assert_eq!(receipt.new_credit_score, 500);
     }
 
 }
