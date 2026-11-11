@@ -14,6 +14,9 @@ pub enum MarketError {
     UnauthorizedOwner = 5,
     InvalidPrice = 6,
     ItemNotFound = 7,
+    TaxNotDue = 8,
+    TaxDelinquent = 9,
+    NotDelinquent = 10,
 }
 
 #[contracttype]
@@ -47,6 +50,16 @@ pub struct PropertyRevenuePool {
     pub accumulated_revenue: i128,
     pub total_claimed: i128,
     pub last_claim_ledger: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TaxAssessment {
+    pub property_id: u32,
+    pub owner: Address,
+    pub tax_due_stroops: i128,
+    pub due_ledger: u32,
+    pub delinquent: bool,
 }
 
 #[contracttype]
@@ -84,6 +97,7 @@ pub enum DataKey {
     ItemCount,
     Item(u32),
     RevenuePool(u32),
+    TaxAssessment(u32),
 }
 
 const DAY_IN_LEDGERS: u32 = 17_280;
@@ -379,6 +393,109 @@ impl RealEstateExchangeContract {
         e.storage().persistent().get(&DataKey::Deed(property_id))
     }
 
+    pub fn assess_property_tax(
+        e: Env,
+        property_id: u32,
+    ) -> Result<TaxAssessment, MarketError> {
+        let deed: PropertyDeed = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Deed(property_id))
+            .ok_or(MarketError::PropertyNotFound)?;
+        let prop_tax_bps: u32 = e
+            .storage()
+            .instance()
+            .get(&DataKey::PropertyTaxBps)
+            .unwrap_or(200);
+        let tax_due = (deed.price_stroops * (prop_tax_bps as i128)) / 10_000;
+        let due_ledger = e.ledger().sequence() + 100;
+
+        let assessment = TaxAssessment {
+            property_id,
+            owner: deed.owner,
+            tax_due_stroops: tax_due,
+            due_ledger,
+            delinquent: false,
+        };
+        e.storage()
+            .persistent()
+            .set(&DataKey::TaxAssessment(property_id), &assessment);
+
+        e.events().publish(
+            (symbol_short!("market"), symbol_short!("tax_ass")),
+            (property_id, tax_due, due_ledger),
+        );
+        Ok(assessment)
+    }
+
+    pub fn pay_property_tax(
+        e: Env,
+        payer: Address,
+        property_id: u32,
+    ) -> Result<i128, MarketError> {
+        payer.require_auth();
+        let key = DataKey::TaxAssessment(property_id);
+        let mut assessment: TaxAssessment = e
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(MarketError::PropertyNotFound)?;
+
+        if assessment.tax_due_stroops == 0 {
+            return Err(MarketError::TaxNotDue);
+        }
+        let paid = assessment.tax_due_stroops;
+        assessment.tax_due_stroops = 0;
+        assessment.delinquent = false;
+        e.storage().persistent().set(&key, &assessment);
+
+        e.events().publish(
+            (symbol_short!("market"), symbol_short!("tax_paid")),
+            (property_id, payer, paid),
+        );
+        Ok(paid)
+    }
+
+    pub fn seize_delinquent_property(
+        e: Env,
+        _caller: Address,
+        property_id: u32,
+    ) -> Result<(), MarketError> {
+        let tax_key = DataKey::TaxAssessment(property_id);
+        let mut assessment: TaxAssessment = e
+            .storage()
+            .persistent()
+            .get(&tax_key)
+            .ok_or(MarketError::PropertyNotFound)?;
+
+        if e.ledger().sequence() <= assessment.due_ledger || assessment.tax_due_stroops == 0 {
+            return Err(MarketError::NotDelinquent);
+        }
+
+        assessment.delinquent = true;
+        e.storage().persistent().set(&tax_key, &assessment);
+
+        let deed_key = DataKey::Deed(property_id);
+        let mut deed: PropertyDeed = e
+            .storage()
+            .persistent()
+            .get(&deed_key)
+            .ok_or(MarketError::PropertyNotFound)?;
+        deed.for_sale = true;
+        e.storage().persistent().set(&deed_key, &deed);
+
+        e.events().publish(
+            (symbol_short!("market"), symbol_short!("seized")),
+            (property_id, deed.owner),
+        );
+        Ok(())
+    }
+
+    pub fn get_tax_assessment(e: Env, property_id: u32) -> Option<TaxAssessment> {
+        e.storage().persistent().get(&DataKey::TaxAssessment(property_id))
+    }
+
+
     pub fn claim_property_yield(
         e: Env,
         owner: Address,
@@ -434,7 +551,7 @@ impl RealEstateExchangeContract {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Ledger as _};
 
     #[test]
     fn test_catalog_item_inventory_and_purchase() {
@@ -512,6 +629,41 @@ mod test {
         let pool_after = client.get_revenue_pool(&prop_id);
         assert_eq!(pool_after.accumulated_revenue, 0);
         assert_eq!(pool_after.total_claimed, 19_700);
+    }
+
+
+    #[test]
+    fn test_property_tax_assessment_and_foreclosure() {
+        let e = Env::default();
+        e.mock_all_auths();
+
+        let contract_id = e.register_contract(None, RealEstateExchangeContract);
+        let client = RealEstateExchangeContractClient::new(&e, &contract_id);
+
+        let alice = Address::generate(&e);
+        let bob = Address::generate(&e);
+
+        let prop_id = client.register_property(
+            &alice,
+            &PropertyType::Residential,
+            &String::from_str(&e, "Sunset Villa"),
+            &100_000,
+            &0,
+        );
+
+        e.ledger().set_sequence_number(1_000);
+        let assessment = client.assess_property_tax(&prop_id);
+        assert_eq!(assessment.tax_due_stroops, 2_000);
+        assert_eq!(assessment.due_ledger, 1_100);
+
+        e.ledger().set_sequence_number(1_050);
+        assert!(client.try_seize_delinquent_property(&bob, &prop_id).is_err());
+
+        e.ledger().set_sequence_number(1_101);
+        client.seize_delinquent_property(&bob, &prop_id);
+
+        let prop = client.get_property(&prop_id).unwrap();
+        assert!(prop.for_sale);
     }
 
 }
