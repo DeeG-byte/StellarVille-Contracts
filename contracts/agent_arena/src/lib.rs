@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env,
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Vec,
 };
 
 #[contracterror]
@@ -11,6 +11,9 @@ pub enum ArenaError {
     InvalidWagerAmount = 2,
     WagerExceedsHouseLimit = 3,
     InsufficientShares = 4,
+    RoundNotFound = 5,
+    RoundNotEnded = 6,
+    RoundAlreadyDrawn = 7,
 }
 
 #[contracttype]
@@ -33,6 +36,17 @@ pub struct WagerReceipt {
     pub payout_stroops: i128,
     pub won: bool,
     pub ledger: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LotteryRound {
+    pub round_id: u32,
+    pub ticket_price_stroops: i128,
+    pub pot_stroops: i128,
+    pub participants: Vec<Address>,
+    pub end_ledger: u32,
+    pub winner: Option<Address>,
 }
 
 #[contracttype]
@@ -61,6 +75,7 @@ pub enum DataKey {
     Receipt(u64),
     PoolState,
     LpRecord(Address),
+    Lottery(u32),
 }
 
 #[contract]
@@ -283,12 +298,96 @@ impl AgentArenaContract {
     pub fn get_house_reserve(e: Env) -> i128 {
         e.storage().instance().get(&DataKey::HouseReserve).unwrap_or(0)
     }
+
+    pub fn init_lottery_round(
+        e: Env,
+        round_id: u32,
+        ticket_price_stroops: i128,
+        end_ledger: u32,
+    ) -> Result<(), ArenaError> {
+        let key = DataKey::Lottery(round_id);
+        if e.storage().persistent().has(&key) {
+            return Err(ArenaError::AlreadyInitialized);
+        }
+        let round = LotteryRound {
+            round_id,
+            ticket_price_stroops,
+            pot_stroops: 0,
+            participants: Vec::new(&e),
+            end_ledger,
+            winner: None,
+        };
+        e.storage().persistent().set(&key, &round);
+        Ok(())
+    }
+
+    pub fn buy_lottery_ticket(e: Env, buyer: Address, round_id: u32) -> Result<(), ArenaError> {
+        buyer.require_auth();
+        let key = DataKey::Lottery(round_id);
+        let mut round: LotteryRound = e
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ArenaError::RoundNotFound)?;
+
+        if round.winner.is_some() {
+            return Err(ArenaError::RoundAlreadyDrawn);
+        }
+        round.participants.push_back(buyer.clone());
+        round.pot_stroops += round.ticket_price_stroops;
+        e.storage().persistent().set(&key, &round);
+
+        e.events().publish(
+            (symbol_short!("arena"), symbol_short!("lotto_buy")),
+            (round_id, buyer, round.ticket_price_stroops),
+        );
+        Ok(())
+    }
+
+    pub fn draw_lottery_winner(e: Env, round_id: u32) -> Result<Option<Address>, ArenaError> {
+        let key = DataKey::Lottery(round_id);
+        let mut round: LotteryRound = e
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(ArenaError::RoundNotFound)?;
+
+        if round.winner.is_some() {
+            return Err(ArenaError::RoundAlreadyDrawn);
+        }
+        if e.ledger().sequence() < round.end_ledger {
+            return Err(ArenaError::RoundNotEnded);
+        }
+
+        if round.participants.is_empty() {
+            return Ok(None);
+        }
+
+        let winner_idx = e.prng().gen_range::<u64>(0..round.participants.len() as u64) as u32;
+        let winner = round.participants.get(winner_idx).unwrap();
+        round.winner = Some(winner.clone());
+        e.storage().persistent().set(&key, &round);
+
+        let treasury_cut = (round.pot_stroops * 500) / 10_000;
+        let winner_payout = round.pot_stroops - treasury_cut;
+
+        e.events().publish(
+            (symbol_short!("arena"), symbol_short!("lotto_win")),
+            (round_id, winner.clone(), winner_payout, treasury_cut),
+        );
+        Ok(Some(winner))
+    }
+
+    pub fn get_lottery_round(e: Env, round_id: u32) -> Option<LotteryRound> {
+        e.storage().persistent().get(&DataKey::Lottery(round_id))
+    }
+
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Ledger as _};
 
     #[test]
     fn test_house_liquidity_pool_and_shares() {
@@ -309,4 +408,37 @@ mod test {
         assert_eq!(withdrawn, 250_000);
         assert_eq!(client.get_house_reserve(), 1_250_000);
     }
+
+    #[test]
+    fn test_national_lottery_draw() {
+        let e = Env::default();
+        e.mock_all_auths();
+
+        let contract_id = e.register_contract(None, AgentArenaContract);
+        let client = AgentArenaContractClient::new(&e, &contract_id);
+
+        let alice = Address::generate(&e);
+        let bob = Address::generate(&e);
+
+        client.init_lottery_round(&1, &100_000, &500);
+        client.buy_lottery_ticket(&alice, &1);
+        client.buy_lottery_ticket(&bob, &1);
+
+        let round = client.get_lottery_round(&1).unwrap();
+        assert_eq!(round.pot_stroops, 200_000);
+        assert_eq!(round.participants.len(), 2);
+
+        e.ledger().set_sequence_number(499);
+        assert!(client.try_draw_lottery_winner(&1).is_err());
+
+        e.ledger().set_sequence_number(500);
+        let winner = client.draw_lottery_winner(&1);
+        assert!(winner.is_some());
+        let winner_addr = winner.unwrap();
+        assert!(winner_addr == alice || winner_addr == bob);
+
+        let round_after = client.get_lottery_round(&1).unwrap();
+        assert!(round_after.winner.is_some());
+    }
+
 }
