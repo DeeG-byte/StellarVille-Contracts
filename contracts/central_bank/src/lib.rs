@@ -33,6 +33,15 @@ pub enum DataKey {
     BondCount,
     Bond(u32),
     CreditTier,
+    AccrualIndexKey,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AccrualIndex {
+    pub borrow_index_scaled: i128,
+    pub savings_index_scaled: i128,
+    pub last_update_ledger: u32,
 }
 
 #[contracttype]
@@ -96,6 +105,12 @@ impl CentralBankContract {
         e.storage().instance().set(&DataKey::Asset, &asset);
         e.storage().instance().set(&DataKey::BaseInterestBps, &base_interest_bps);
         e.storage().instance().set(&DataKey::SavingsYieldBps, &savings_yield_bps);
+        let initial_index = AccrualIndex {
+            borrow_index_scaled: 1_000_000,
+            savings_index_scaled: 1_000_000,
+            last_update_ledger: e.ledger().sequence(),
+        };
+        e.storage().instance().set(&DataKey::AccrualIndexKey, &initial_index);
         e.storage().instance().set(&DataKey::MinReserveRatioBps, &2000u32);
         e.storage().instance().set(&DataKey::TotalDeposits, &0i128);
         e.storage().instance().set(&DataKey::TotalBorrows, &0i128);
@@ -484,6 +499,61 @@ impl CentralBankContract {
         }
     }
 
+    
+    pub fn accrue_interest(e: Env) -> AccrualIndex {
+        let mut index: AccrualIndex = e
+            .storage()
+            .instance()
+            .get(&DataKey::AccrualIndexKey)
+            .unwrap_or(AccrualIndex {
+                borrow_index_scaled: 1_000_000,
+                savings_index_scaled: 1_000_000,
+                last_update_ledger: e.ledger().sequence(),
+            });
+
+        let current_ledger = e.ledger().sequence();
+        if current_ledger > index.last_update_ledger {
+            let delta = (current_ledger - index.last_update_ledger) as i128;
+            let base_borrow_bps: u32 = e
+                .storage()
+                .instance()
+                .get(&DataKey::BaseInterestBps)
+                .unwrap_or(400);
+            let savings_yield_bps: u32 = e
+                .storage()
+                .instance()
+                .get(&DataKey::SavingsYieldBps)
+                .unwrap_or(250);
+
+            let borrow_growth = (index.borrow_index_scaled * (base_borrow_bps as i128) * delta)
+                / (10_000 * 17_280);
+            let savings_growth = (index.savings_index_scaled * (savings_yield_bps as i128) * delta)
+                / (10_000 * 17_280);
+
+            index.borrow_index_scaled += borrow_growth;
+            index.savings_index_scaled += savings_growth;
+            index.last_update_ledger = current_ledger;
+            e.storage().instance().set(&DataKey::AccrualIndexKey, &index);
+
+            e.events().publish(
+                (symbol_short!("bank"), symbol_short!("accrue")),
+                (current_ledger, index.borrow_index_scaled, index.savings_index_scaled),
+            );
+        }
+        index
+    }
+
+    pub fn get_accrual_index(e: Env) -> AccrualIndex {
+        e.storage()
+            .instance()
+            .get(&DataKey::AccrualIndexKey)
+            .unwrap_or(AccrualIndex {
+                borrow_index_scaled: 1_000_000,
+                savings_index_scaled: 1_000_000,
+                last_update_ledger: e.ledger().sequence(),
+            })
+    }
+
     pub fn get_rates(e: Env) -> (u32, u32) {
         let borrow_bps: u32 = e
             .storage()
@@ -502,7 +572,7 @@ impl CentralBankContract {
 #[cfg(test)]
 mod test {
     use super::*;
-    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::testutils::{Address as _, Ledger as _};
 
     #[test]
     fn test_credit_score_borrowing_limits() {
@@ -528,4 +598,29 @@ mod test {
         client.repay(&alice, &500_000);
         assert_eq!(client.get_max_borrow_limit(&alice), 615_000);
     }
+
+    #[test]
+    fn test_interest_accrual_index() {
+        let e = Env::default();
+        e.mock_all_auths();
+
+        let contract_id = e.register_contract(None, CentralBankContract);
+        let client = CentralBankContractClient::new(&e, &contract_id);
+
+        let gov = Address::generate(&e);
+        let asset = Address::generate(&e);
+
+        e.ledger().set_sequence_number(1_000);
+        client.initialize(&gov, &asset, &400, &250);
+
+        let initial = client.get_accrual_index();
+        assert_eq!(initial.borrow_index_scaled, 1_000_000);
+        assert_eq!(initial.last_update_ledger, 1_000);
+
+        e.ledger().set_sequence_number(1_000 + 172_800);
+        let updated = client.accrue_interest();
+        assert_eq!(updated.borrow_index_scaled, 1_400_000);
+        assert_eq!(updated.savings_index_scaled, 1_250_000);
+    }
+
 }
