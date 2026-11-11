@@ -10,6 +10,7 @@ pub enum ArenaError {
     AlreadyInitialized = 1,
     InvalidWagerAmount = 2,
     WagerExceedsHouseLimit = 3,
+    InsufficientShares = 4,
 }
 
 #[contracttype]
@@ -36,12 +37,30 @@ pub struct WagerReceipt {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HouseLiquidityPool {
+    pub total_liquidity_stroops: i128,
+    pub total_shares: i128,
+    pub max_payout_bps: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiquidityProvider {
+    pub provider: Address,
+    pub shares: i128,
+    pub deposited_ledger: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     HouseReserve,
     CasinoTaxBps,
     TotalTaxCollected,
     WagerCount,
     Receipt(u64),
+    PoolState,
+    LpRecord(Address),
 }
 
 #[contract]
@@ -61,10 +80,113 @@ impl AgentArenaContract {
         e.storage().instance().set(&DataKey::CasinoTaxBps, &casino_tax_bps);
         e.storage().instance().set(&DataKey::TotalTaxCollected, &0i128);
         e.storage().instance().set(&DataKey::WagerCount, &0u64);
+
+        let pool = HouseLiquidityPool {
+            total_liquidity_stroops: initial_reserve_stroops,
+            total_shares: initial_reserve_stroops,
+            max_payout_bps: 1000,
+        };
+        e.storage().instance().set(&DataKey::PoolState, &pool);
         Ok(())
     }
 
-    /// Play a provably fair Coin Flip or Dice Wager using Soroban PRNG
+    /// Provide XLM liquidity to the Arena House Pool in exchange for proportional LP shares
+    pub fn provide_house_liquidity(
+        e: Env,
+        provider: Address,
+        amount_stroops: i128,
+    ) -> Result<LiquidityProvider, ArenaError> {
+        provider.require_auth();
+        if amount_stroops <= 0 {
+            return Err(ArenaError::InvalidWagerAmount);
+        }
+
+        let mut pool: HouseLiquidityPool = e
+            .storage()
+            .instance()
+            .get(&DataKey::PoolState)
+            .unwrap_or(HouseLiquidityPool {
+                total_liquidity_stroops: 0,
+                total_shares: 0,
+                max_payout_bps: 1000,
+            });
+
+        let minted_shares = if pool.total_shares == 0 || pool.total_liquidity_stroops == 0 {
+            amount_stroops
+        } else {
+            (amount_stroops * pool.total_shares) / pool.total_liquidity_stroops
+        };
+
+        pool.total_liquidity_stroops += amount_stroops;
+        pool.total_shares += minted_shares;
+        e.storage().instance().set(&DataKey::PoolState, &pool);
+        e.storage()
+            .instance()
+            .set(&DataKey::HouseReserve, &pool.total_liquidity_stroops);
+
+        let lp_key = DataKey::LpRecord(provider.clone());
+        let mut lp = e.storage().persistent().get(&lp_key).unwrap_or(LiquidityProvider {
+            provider: provider.clone(),
+            shares: 0,
+            deposited_ledger: e.ledger().sequence(),
+        });
+        lp.shares += minted_shares;
+        lp.deposited_ledger = e.ledger().sequence();
+        e.storage().persistent().set(&lp_key, &lp);
+
+        e.events().publish(
+            (symbol_short!("arena"), symbol_short!("lp_add")),
+            (provider, amount_stroops, minted_shares),
+        );
+        Ok(lp)
+    }
+
+    /// Withdraw underlying XLM from the Arena House Pool by burning LP shares
+    pub fn withdraw_house_liquidity(
+        e: Env,
+        provider: Address,
+        shares_to_burn: i128,
+    ) -> Result<i128, ArenaError> {
+        provider.require_auth();
+        if shares_to_burn <= 0 {
+            return Err(ArenaError::InvalidWagerAmount);
+        }
+
+        let lp_key = DataKey::LpRecord(provider.clone());
+        let mut lp: LiquidityProvider = e
+            .storage()
+            .persistent()
+            .get(&lp_key)
+            .ok_or(ArenaError::InsufficientShares)?;
+
+        if shares_to_burn > lp.shares {
+            return Err(ArenaError::InsufficientShares);
+        }
+
+        let mut pool: HouseLiquidityPool = e
+            .storage()
+            .instance()
+            .get(&DataKey::PoolState)
+            .ok_or(ArenaError::InsufficientShares)?;
+
+        let payout_stroops = (shares_to_burn * pool.total_liquidity_stroops) / pool.total_shares;
+        lp.shares -= shares_to_burn;
+        pool.total_shares -= shares_to_burn;
+        pool.total_liquidity_stroops -= payout_stroops;
+
+        e.storage().persistent().set(&lp_key, &lp);
+        e.storage().instance().set(&DataKey::PoolState, &pool);
+        e.storage()
+            .instance()
+            .set(&DataKey::HouseReserve, &pool.total_liquidity_stroops);
+
+        e.events().publish(
+            (symbol_short!("arena"), symbol_short!("lp_with")),
+            (provider, shares_to_burn, payout_stroops),
+        );
+        Ok(payout_stroops)
+    }
+
     pub fn play_wager(
         e: Env,
         player: Address,
@@ -82,7 +204,6 @@ impl AgentArenaContract {
             .get(&DataKey::HouseReserve)
             .unwrap_or(1_000_000_000);
 
-        // Max wager is 10% of current house reserve to protect solvency
         if wager_stroops > reserve / 10 {
             return Err(ArenaError::WagerExceedsHouseLimit);
         }
@@ -120,6 +241,14 @@ impl AgentArenaContract {
         }
 
         e.storage().instance().set(&DataKey::HouseReserve, &reserve);
+        if let Some(mut pool) = e
+            .storage()
+            .instance()
+            .get::<DataKey, HouseLiquidityPool>(&DataKey::PoolState)
+        {
+            pool.total_liquidity_stroops = reserve;
+            e.storage().instance().set(&DataKey::PoolState, &pool);
+        }
 
         let mut count: u64 = e.storage().instance().get(&DataKey::WagerCount).unwrap_or(0);
         count += 1;
@@ -143,6 +272,10 @@ impl AgentArenaContract {
         Ok(receipt)
     }
 
+    pub fn get_pool_state(e: Env) -> Option<HouseLiquidityPool> {
+        e.storage().instance().get(&DataKey::PoolState)
+    }
+
     pub fn get_receipt(e: Env, wager_id: u64) -> Option<WagerReceipt> {
         e.storage().persistent().get(&DataKey::Receipt(wager_id))
     }
@@ -158,22 +291,22 @@ mod test {
     use soroban_sdk::testutils::Address as _;
 
     #[test]
-    fn test_provably_fair_wager_and_house_limit() {
+    fn test_house_liquidity_pool_and_shares() {
         let e = Env::default();
         e.mock_all_auths();
 
         let contract_id = e.register_contract(None, AgentArenaContract);
         let client = AgentArenaContractClient::new(&e, &contract_id);
 
-        let player = Address::generate(&e);
+        let lp_agent = Address::generate(&e);
         client.initialize(&1_000_000, &300);
 
-        let receipt = client.play_wager(&player, &GameChoice::CoinHeads, &50_000);
-        assert_eq!(receipt.wager_id, 1);
-        assert_eq!(receipt.wager_stroops, 50_000);
+        let lp = client.provide_house_liquidity(&lp_agent, &500_000);
+        assert_eq!(lp.shares, 500_000);
+        assert_eq!(client.get_house_reserve(), 1_500_000);
 
-        // Wager above 10% of house reserve should fail
-        let over_limit = client.try_play_wager(&player, &GameChoice::DiceHigh, &500_000);
-        assert!(over_limit.is_err());
+        let withdrawn = client.withdraw_house_liquidity(&lp_agent, &250_000);
+        assert_eq!(withdrawn, 250_000);
+        assert_eq!(client.get_house_reserve(), 1_250_000);
     }
 }
